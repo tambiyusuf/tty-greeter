@@ -9,10 +9,11 @@
 #include <unistd.h>
 #include <cstdio>
 #include <cstring>
+#include <signal.h>
 
 using namespace greeter;
 
-// Finds the next available virtual terminal number
+// VT numarası bul
 int allocateVT() {
     FILE* log = fopen("/tmp/main-full.log", "a");
     fprintf(log, "[allocateVT] Starting\n");
@@ -40,6 +41,10 @@ int allocateVT() {
 }
 
 int main() {
+    // Signal handling - greeter kapanırsa child session devam etsin
+    signal(SIGINT, SIG_IGN);
+    signal(SIGTERM, SIG_IGN);
+
     FILE* log = fopen("/tmp/main-full.log", "w");
     fprintf(log, "[main] Started\n");
     fprintf(log, "[main] PID: %d, PPID: %d\n", getpid(), getppid());
@@ -117,7 +122,7 @@ int main() {
         fflush(log);
         std::string selected_user = users[user_choice];
 
-        // 2. Password input
+        // 2. Password
         fprintf(log, "[main] Calling getPassword\n");
         fflush(log);
         fclose(log);
@@ -127,54 +132,33 @@ int main() {
         log = fopen("/tmp/main-full.log", "a");
         fprintf(log, "[main] Password received (length: %zu)\n", password.length());
         fflush(log);
+
+        // 3. VT allocate
+        fprintf(log, "[main] Calling allocateVT\n");
+        fflush(log);
+
+        int vt_number = allocateVT();
+
+        fprintf(log, "[main] VT allocated: %d\n", vt_number);
+        fflush(log);
         fclose(log);
 
         menu.showMessage("Authenticating...", false);
 
         log = fopen("/tmp/main-full.log", "a");
-        fprintf(log, "[main] Calling allocateVT\n");
-        fflush(log);
 
-        // Allocate a virtual terminal for the new session
-        int vt_number = allocateVT();
-
-        fprintf(log, "[main] VT allocated: %d\n", vt_number);
-        fflush(log);
-
-        // 3. Open PAM session
-        fprintf(log, "[main] Opening PAM session\n");
-        fflush(log);
-
-        PamSession* pam_session = auth.openSession(selected_user, password, vt_number);
-
-        if (!pam_session) {
-            fprintf(log, "[main] PAM authentication failed\n");
-            fclose(log);
-            menu.showMessage("Authentication failed!", true);
-            continue;
-        }
-
-        fprintf(log, "[main] PAM session opened successfully\n");
-        fprintf(log, "[main] Session ID: %s\n", pam_session->session_id.c_str());
-        fprintf(log, "[main] Runtime Dir: %s\n", pam_session->runtime_dir.c_str());
-        fflush(log);
-        fclose(log);
-
-        menu.showMessage("Authentication successful!", false);
-
-        log = fopen("/tmp/main-full.log", "a");
+        // 4. Session selection
         fprintf(log, "[main] Getting available sessions\n");
         fflush(log);
 
-        // 4. Session selection
         auto sessions = sessionMgr.getAvailableSessions();
         fprintf(log, "[main] Got %zu sessions\n", sessions.size());
         fflush(log);
 
         std::vector<std::string> session_names;
         for (const auto& s : sessions) {
-            session_names.push_back(s.name);
-            fprintf(log, "[main] Session: %s\n", s.name.c_str());
+            session_names.push_back(s.name + " (" + s.type + ")");
+            fprintf(log, "[main] Session: %s (type: %s)\n", s.name.c_str(), s.type.c_str());
             fflush(log);
         }
         session_names.push_back("Back");
@@ -190,18 +174,39 @@ int main() {
         fflush(log);
 
         if (session_choice == -1 || session_names[session_choice] == "Back") {
-            fprintf(log, "[main] Back selected, closing PAM session\n");
-            fflush(log);
+            fprintf(log, "[main] Back selected, continuing loop\n");
             fclose(log);
-            auth.closeSession(pam_session);
             continue;
         }
 
         fprintf(log, "[main] Selected session: %s\n", sessions[session_choice].name.c_str());
+        fprintf(log, "[main] Session type: %s\n", sessions[session_choice].type.c_str());
+        fflush(log);
+
+        // 5. PAM SESSION AÇ
+        fprintf(log, "[main] Opening PAM session with type: %s\n", sessions[session_choice].type.c_str());
+        fflush(log);
+
+        PamSession* pam_session = auth.openSession(
+            selected_user,
+            password,
+            vt_number,
+            sessions[session_choice].type
+        );
+
+        if (!pam_session) {
+            fprintf(log, "[main] PAM authentication failed\n");
+            fclose(log);
+            menu.showMessage("Authentication failed!", true);
+            continue;
+        }
+
+        fprintf(log, "[main] PAM session opened successfully\n");
+        fprintf(log, "[main] Session ID: %s\n", pam_session->session_id.c_str());
+        fprintf(log, "[main] Runtime Dir: %s\n", pam_session->runtime_dir.c_str());
         fflush(log);
         fclose(log);
 
-        // 5. Launch session
         menu.showMessage("Starting session...", false);
 
         log = fopen("/tmp/main-full.log", "a");
@@ -233,24 +238,16 @@ int main() {
             continue;
         }
 
-        fprintf(log, "[main] Waiting for child process\n");
-        fflush(log);
-
-        // 6. Wait for the child process to exit
-        int status;
-        wait(&status);
-
-        fprintf(log, "[main] Child exited with status: %d\n", status);
-        fflush(log);
-
-        // 7. Close the PAM session
-        fprintf(log, "[main] Closing PAM session\n");
-        fflush(log);
-        auth.closeSession(pam_session);
-
-        fprintf(log, "[main] PAM session closed\n");
+        // 6. Session başarıyla başladı - GREETER KAPANIYOR
+        fprintf(log, "[main] Session started successfully\n");
+        fprintf(log, "[main] Greeter exiting, session running in background\n");
+        fprintf(log, "[main] PAM session remains open for child process\n");
         fflush(log);
         fclose(log);
+
+        // PAM session'ı KAPATMIYORUZ - child process kullanıyor!
+        // Greeter kapanıyor, systemd restart edecek
+        return 0;
     }
 
     return 0;

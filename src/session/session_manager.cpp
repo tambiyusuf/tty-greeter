@@ -11,8 +11,19 @@
 #include <errno.h>
 #include <linux/vt.h>
 #include <linux/kd.h>
+#include <signal.h>
 
 namespace greeter {
+
+// Signal handler for intermediate process
+static void intermediate_signal_handler(int sig) {
+    FILE* f = fopen("/tmp/intermediate-signal.log", "a");
+    if (f) {
+        fprintf(f, "Received signal %d! Exiting...\n", sig);
+        fclose(f);
+    }
+    _exit(0);
+}
 
 SessionManager::SessionManager() {
     scanWaylandSessions();
@@ -26,7 +37,7 @@ std::vector<SessionInfo> SessionManager::getAvailableSessions() {
 void SessionManager::scanWaylandSessions() {
     sessions_.push_back({
         "KDE Plasma (Wayland)",
-        "dbus-run-session startplasma-wayland",
+        "startplasma-wayland",
         "wayland"
     });
 
@@ -46,162 +57,215 @@ bool SessionManager::startSession(const std::string& username,
                                    const std::string& session_id,
                                    const std::string& runtime_dir,
                                    int vt_number) {
-    // Look up the user's account information
-    struct passwd* pw = getpwnam(username.c_str());
-    if (!pw) {
-        return false;
-    }
 
-    uid_t user_uid = pw->pw_uid;
-    gid_t user_gid = pw->pw_gid;
-    const char* user_home = pw->pw_dir;
-    const char* user_shell = pw->pw_shell;
+    FILE* log = fopen("/tmp/session-manager-parent.log", "w");
+    fprintf(log, "=== Session Manager (Parent) ===\n");
 
-    // Open the target VT in the parent process before forking (mirrors SDDM behaviour)
-    char tty_path[32];
-    sprintf(tty_path, "/dev/tty%d", vt_number);
+    char vt_path[32];
+    snprintf(vt_path, sizeof(vt_path), "/dev/tty%d", vt_number);
 
-    FILE* sm_log = fopen("/tmp/session-manager-parent.log", "w");
-    fprintf(sm_log, "PARENT: Opening VT: %s\n", tty_path);
-    fflush(sm_log);
-
-    int vt_fd = open(tty_path, O_RDWR | O_NOCTTY);
+    int vt_fd = open(vt_path, O_RDWR | O_NOCTTY);
     if (vt_fd < 0) {
-        fprintf(sm_log, "PARENT: Failed to open VT: %s\n", strerror(errno));
-        fclose(sm_log);
+        fprintf(log, "Failed to open %s: %s\n", vt_path, strerror(errno));
+        fclose(log);
         return false;
     }
 
-    fprintf(sm_log, "PARENT: VT opened successfully, fd=%d\n", vt_fd);
-    fclose(sm_log);
+    fprintf(log, "Opened VT fd: %d for %s\n", vt_fd, vt_path);
+    fflush(log);
+    fclose(log);
 
-    pid_t pid = fork();
+    // FIRST FORK - Intermediate process
+    pid_t intermediate_pid = fork();
 
-    if (pid < 0) {
+    if (intermediate_pid < 0) {
         close(vt_fd);
         return false;
     }
 
-    if (pid == 0) {
-        // ═══ CHILD PROCESS ═══
+    if (intermediate_pid > 0) {
+        // GREETER - hemen return
+        close(vt_fd);
+        return true;
+    }
 
-        // Redirect stderr to a log file for debugging
-        int logfd = open("/tmp/greeter-child.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (logfd >= 0) {
-            dup2(logfd, 2);
-            close(logfd);
-        }
+    // === INTERMEDIATE PROCESS ===
 
-        fprintf(stderr, "=== Child Process ===\n"); fflush(stderr);
-        fprintf(stderr, "PID: %d, PPID: %d\n", getpid(), getppid()); fflush(stderr);
-        fprintf(stderr, "User: %s (UID=%d, GID=%d)\n", username.c_str(), user_uid, user_gid); fflush(stderr);
-        fprintf(stderr, "VT: %d\n", vt_number); fflush(stderr);
-        fprintf(stderr, "Inherited VT fd: %d\n", vt_fd); fflush(stderr);
+    // Systemd'den ayrıl
+    setsid();
 
-        // Wire the inherited VT fd to stdin
-        fprintf(stderr, "Redirecting inherited VT fd to stdin...\n"); fflush(stderr);
+    signal(SIGTERM, intermediate_signal_handler);
+    signal(SIGHUP, intermediate_signal_handler);
+
+    FILE* intermediate_log = fopen("/tmp/session-intermediate.log", "w");
+    fprintf(intermediate_log, "=== Intermediate Process ===\n");
+    fprintf(intermediate_log, "PID: %d, PPID: %d, SID: %d\n", getpid(), getppid(), getsid(0));
+    fflush(intermediate_log);
+
+    // SECOND FORK - Session process
+    pid_t session_pid = fork();
+
+    if (session_pid < 0) {
+        fprintf(intermediate_log, "Session fork failed: %s\n", strerror(errno));
+        fflush(intermediate_log);
+        fclose(intermediate_log);
+        close(vt_fd);
+        _exit(1);
+    }
+
+    if (session_pid == 0) {
+        // === SESSION PROCESS ===
+        fclose(intermediate_log);
+
+        FILE* child_log = fopen("/tmp/greeter-child.log", "w");
+        fprintf(child_log, "=== Child Process ===\n");
+        fprintf(child_log, "PID: %d, PPID: %d\n", getpid(), getppid());
+
+        struct passwd* pw = getpwnam(username.c_str());
+        fprintf(child_log, "User: %s (UID=%d, GID=%d)\n",
+                username.c_str(), pw->pw_uid, pw->pw_gid);
+        fprintf(child_log, "VT: %d\n", vt_number);
+        fprintf(child_log, "Inherited VT fd: %d\n", vt_fd);
+        fflush(child_log);
+
+        // VT setup
+        fprintf(child_log, "Redirecting inherited VT fd to stdin...\n");
         dup2(vt_fd, STDIN_FILENO);
-        close(vt_fd);
-        fprintf(stderr, "VT redirected to stdin\n"); fflush(stderr);
+        dup2(vt_fd, STDOUT_FILENO);
+        dup2(vt_fd, STDERR_FILENO);
+        if (vt_fd > 2) close(vt_fd);
+        fprintf(child_log, "VT redirected to stdin\n");
+        fflush(child_log);
 
-        // Become a session leader
-        fprintf(stderr, "Calling setsid()...\n"); fflush(stderr);
+        // Session leader
+        fprintf(child_log, "Calling setsid()...\n");
         pid_t sid = setsid();
-        fprintf(stderr, "setsid() returned: %d (errno: %d, %s)\n", sid, errno, strerror(errno)); fflush(stderr);
+        fprintf(child_log, "setsid() returned: %d (errno: %d, %s)\n",
+                sid, errno, strerror(errno));
+        fflush(child_log);
 
         if (sid < 0) {
-            fprintf(stderr, "ERROR: setsid() failed\n"); fflush(stderr);
-            exit(1);
+            fprintf(child_log, "setsid() failed!\n");
+            fclose(child_log);
+            _exit(1);
         }
-        fprintf(stderr, "setsid() OK, SID=%d\n", sid); fflush(stderr);
+        fprintf(child_log, "setsid() OK, SID=%d\n", sid);
 
-        // Acquire the controlling terminal
-        fprintf(stderr, "Calling TIOCSCTTY...\n"); fflush(stderr);
-        if (ioctl(STDIN_FILENO, TIOCSCTTY, 0) < 0) {
-            fprintf(stderr, "ERROR: TIOCSCTTY: %s (errno: %d)\n", strerror(errno), errno); fflush(stderr);
-            exit(1);
+        // Controlling TTY
+        fprintf(child_log, "Calling TIOCSCTTY...\n");
+        if (ioctl(STDIN_FILENO, TIOCSCTTY, 1) < 0) {
+            fprintf(child_log, "TIOCSCTTY failed: %s\n", strerror(errno));
+            fclose(child_log);
+            _exit(1);
         }
-        fprintf(stderr, "TIOCSCTTY OK!\n"); fflush(stderr);
+        fprintf(child_log, "TIOCSCTTY OK!\n");
 
-        // Switch to the allocated VT
-        fprintf(stderr, "Opening /dev/tty0 for VT control...\n"); fflush(stderr);
+        // VT activate
+        fprintf(child_log, "Opening /dev/tty0 for VT control...\n");
         int tty0 = open("/dev/tty0", O_RDWR);
         if (tty0 >= 0) {
-            fprintf(stderr, "VT_ACTIVATE %d\n", vt_number); fflush(stderr);
-            if (ioctl(tty0, VT_ACTIVATE, vt_number) < 0) {
-                fprintf(stderr, "WARNING: VT_ACTIVATE: %s\n", strerror(errno)); fflush(stderr);
-            } else {
-                fprintf(stderr, "VT_ACTIVATE OK\n"); fflush(stderr);
-            }
+            fprintf(child_log, "VT_ACTIVATE %d\n", vt_number);
+            ioctl(tty0, VT_ACTIVATE, vt_number);
+            fprintf(child_log, "VT_ACTIVATE OK\n");
 
-            fprintf(stderr, "VT_WAITACTIVE %d\n", vt_number); fflush(stderr);
-            if (ioctl(tty0, VT_WAITACTIVE, vt_number) < 0) {
-                fprintf(stderr, "WARNING: VT_WAITACTIVE: %s\n", strerror(errno)); fflush(stderr);
-            } else {
-                fprintf(stderr, "VT_WAITACTIVE OK\n"); fflush(stderr);
-            }
+            fprintf(child_log, "VT_WAITACTIVE %d\n", vt_number);
+            ioctl(tty0, VT_WAITACTIVE, vt_number);
+            fprintf(child_log, "VT_WAITACTIVE OK\n");
             close(tty0);
         }
 
-        // Drop root privileges
-        fprintf(stderr, "setgid(%d)...\n", user_gid); fflush(stderr);
-        if (setgid(user_gid) != 0) {
-            fprintf(stderr, "ERROR: setgid: %s\n", strerror(errno)); fflush(stderr);
-            exit(1);
-        }
+        // Drop privileges
+        fprintf(child_log, "setgid(%d)...\n", pw->pw_gid);
+        setgid(pw->pw_gid);
+        fprintf(child_log, "initgroups...\n");
+        initgroups(pw->pw_name, pw->pw_gid);
+        fprintf(child_log, "setuid(%d)...\n", pw->pw_uid);
+        setuid(pw->pw_uid);
+        fprintf(child_log, "Privilege drop OK, UID=%d\n", getuid());
 
-        fprintf(stderr, "initgroups...\n"); fflush(stderr);
-        if (initgroups(username.c_str(), user_gid) != 0) {
-            fprintf(stderr, "WARNING: initgroups: %s\n", strerror(errno)); fflush(stderr);
-        }
-
-        fprintf(stderr, "setuid(%d)...\n", user_uid); fflush(stderr);
-        if (setuid(user_uid) != 0) {
-            fprintf(stderr, "ERROR: setuid: %s\n", strerror(errno)); fflush(stderr);
-            exit(1);
-        }
-        fprintf(stderr, "Privilege drop OK, UID=%d\n", getuid()); fflush(stderr);
-
-        // Set up a clean environment for the user session
-        fprintf(stderr, "Setting environment...\n"); fflush(stderr);
-        clearenv();
-        setenv("HOME", user_home, 1);
-        setenv("USER", username.c_str(), 1);
-        setenv("LOGNAME", username.c_str(), 1);
-        setenv("SHELL", user_shell, 1);
-        setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+        // Environment
+        fprintf(child_log, "Setting environment...\n");
+        setenv("HOME", pw->pw_dir, 1);
+        setenv("USER", pw->pw_name, 1);
+        setenv("LOGNAME", pw->pw_name, 1);
+        setenv("SHELL", pw->pw_shell, 1);
         setenv("XDG_RUNTIME_DIR", runtime_dir.c_str(), 1);
+        setenv("XDG_SESSION_TYPE", session.type.c_str(), 1);
+        setenv("XDG_SESSION_CLASS", "user", 1);
+
         if (!session_id.empty()) {
             setenv("XDG_SESSION_ID", session_id.c_str(), 1);
         }
-        setenv("XDG_SESSION_TYPE", session.type.c_str(), 1);
-        setenv("XDG_SESSION_CLASS", "user", 1);
-        setenv("XDG_SEAT", "seat0", 1);
 
         char vt_str[16];
-        sprintf(vt_str, "%d", vt_number);
+        snprintf(vt_str, sizeof(vt_str), "%d", vt_number);
         setenv("XDG_VTNR", vt_str, 1);
-        setenv("XDG_CURRENT_DESKTOP", "KDE", 1);
 
-        fprintf(stderr, "Environment OK\n"); fflush(stderr);
+        fprintf(child_log, "Environment OK\n");
 
-        if (chdir(user_home) != 0) {
-            fprintf(stderr, "WARNING: chdir failed\n"); fflush(stderr);
-            chdir("/");
+        // Exec session
+        std::string exec_cmd;
+        if (session.type == "wayland") {
+            exec_cmd = "dbus-run-session " + session.exec_command;
+        } else if (session.type == "x11") {
+            exec_cmd = "/bin/sh /tmp/.xinitrc-greeter";
         }
 
-        fprintf(stderr, "Executing: %s\n", session.exec_command.c_str()); fflush(stderr);
+        fprintf(child_log, "Executing: %s\n", exec_cmd.c_str());
+        fflush(child_log);
+        fclose(child_log);
 
-        execl("/bin/sh", "sh", "-c", session.exec_command.c_str(), nullptr);
+        execl("/bin/sh", "sh", "-c", exec_cmd.c_str(), nullptr);
 
-        fprintf(stderr, "ERROR: exec failed: %s\n", strerror(errno)); fflush(stderr);
-        exit(1);
+        // Exec failed
+        FILE* err_log = fopen("/tmp/greeter-child.log", "a");
+        fprintf(err_log, "exec failed: %s\n", strerror(errno));
+        fclose(err_log);
+        _exit(1);
     }
 
-    // ═══ PARENT PROCESS ═══
-    // Keep the VT fd open until the child exits to prevent getty from racing
-    // to reclaim the terminal.
+    // === INTERMEDIATE PROCESS - Wait for session ===
+    close(vt_fd); // Child inherited it
 
-    return true;
+    fprintf(intermediate_log, "Waiting for session process (PID %d)...\n", session_pid);
+    fflush(intermediate_log);
+
+    int status;
+    waitpid(session_pid, &status, 0);
+
+    fprintf(intermediate_log, "Session exited with status: %d\n", WEXITSTATUS(status));
+    fflush(intermediate_log);
+
+    fprintf(intermediate_log, "Switching back to VT1...\n");
+    fflush(intermediate_log);
+
+    // VT1'e dön (greeter için)
+    int tty0 = open("/dev/tty0", O_RDWR);
+    if (tty0 >= 0) {
+        fprintf(intermediate_log, "tty0 opened successfully (fd=%d)\n", tty0);
+        fflush(intermediate_log);
+
+        int ret = ioctl(tty0, VT_ACTIVATE, 1);
+        fprintf(intermediate_log, "VT_ACTIVATE 1 returned: %d (errno: %s)\n", ret, strerror(errno));
+        fflush(intermediate_log);
+
+        ret = ioctl(tty0, VT_WAITACTIVE, 1);
+        fprintf(intermediate_log, "VT_WAITACTIVE 1 returned: %d (errno: %s)\n", ret, strerror(errno));
+        fflush(intermediate_log);
+
+        close(tty0);
+        fprintf(intermediate_log, "VT switch to 1 complete\n");
+        fflush(intermediate_log);
+    } else {
+        fprintf(intermediate_log, "Failed to open tty0: %s\n", strerror(errno));
+        fflush(intermediate_log);
+    }
+
+    fprintf(intermediate_log, "Intermediate process exiting\n");
+    fflush(intermediate_log);
+    fclose(intermediate_log);
+
+    _exit(0);
 }
+
 } // namespace greeter
