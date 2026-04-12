@@ -1,0 +1,27 @@
+# Build output directories
+cmake-build-*/
+build/
+out/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+install_manifest.txt
+CTestTestfile.cmake
+
+# Compiled binary
+greeter
+
+# IDE project files
+.idea/
+*.iml
+.vscode/
+
+# Temporary / debug logs written at runtime
+/tmp/
+
+# OS generated files
+.DS_Store
+Thumbs.db
