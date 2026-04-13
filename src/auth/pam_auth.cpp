@@ -9,6 +9,56 @@
 
 namespace greeter {
 
+// Validates credentials only — no PAM session is opened.
+// Auth check runs before session selection so wrong passwords loop back immediately.
+bool PamAuth::authenticatePassword(const std::string& username,
+                                    const std::string& password) {
+    FILE* auth_debug = fopen("/tmp/pam-password-check.log", "w");
+    fprintf(auth_debug, "=== PAM Password Check (No Session) ===\n");
+    fprintf(auth_debug, "Username: %s\n", username.c_str());
+    fprintf(auth_debug, "Password length: %zu\n", password.length());
+    fflush(auth_debug);
+
+    pam_handle_t* pamh = nullptr;
+    struct pam_conv conv = {
+        pamConversation,
+        (void*)password.c_str()
+    };
+
+    // Initialize PAM with the "login" service.
+    int retval = pam_start("login", username.c_str(), &conv, &pamh);
+    fprintf(auth_debug, "pam_start: %d (%s)\n", retval, pam_strerror(pamh, retval));
+    fflush(auth_debug);
+    if (retval != PAM_SUCCESS) {
+        fclose(auth_debug);
+        return false;
+    }
+
+    // Password-only check — no session side effects.
+    retval = pam_authenticate(pamh, 0);
+    fprintf(auth_debug, "pam_authenticate: %d (%s)\n", retval, pam_strerror(pamh, retval));
+    fflush(auth_debug);
+
+    bool success = (retval == PAM_SUCCESS);
+
+    if (success) {
+        // Verify account status (expiry, lockout, etc.).
+        retval = pam_acct_mgmt(pamh, 0);
+        fprintf(auth_debug, "pam_acct_mgmt: %d (%s)\n", retval, pam_strerror(pamh, retval));
+        fflush(auth_debug);
+
+        success = (retval == PAM_SUCCESS);
+    }
+
+    // No session opened — just clean up and return the result.
+    pam_end(pamh, retval);
+
+    fprintf(auth_debug, "Password check result: %s\n", success ? "SUCCESS" : "FAILED");
+    fclose(auth_debug);
+
+    return success;
+}
+
 int PamAuth::pamConversation(int num_msg, const struct pam_message** msg,
                              struct pam_response** resp, void* appdata_ptr) {
     const char* password = static_cast<const char*>(appdata_ptr);
@@ -50,7 +100,7 @@ PamSession* PamAuth::openSession(const std::string& username,
         (void*)password.c_str()
     };
 
-    // PAM başlat
+    // Initialize PAM with the "login" service.
     int retval = pam_start("login", username.c_str(), &conv, &pamh);
     fprintf(auth_debug, "pam_start: %d (%s)\n", retval, pam_strerror(pamh, retval));
     fflush(auth_debug);
@@ -59,7 +109,7 @@ PamSession* PamAuth::openSession(const std::string& username,
         return nullptr;
     }
 
-    // TTY BİLGİSİNİ SET ET - pam_systemd için kritik!
+    // Set PAM_TTY so pam_systemd can register the correct seat/VT.
     char tty_name[32];
     snprintf(tty_name, sizeof(tty_name), "tty%d", vt_number);
     retval = pam_set_item(pamh, PAM_TTY, tty_name);
@@ -92,7 +142,7 @@ PamSession* PamAuth::openSession(const std::string& username,
         return nullptr;
     }
 
-    // Session properties - DYNAMIC SESSION TYPE
+    // Set XDG session environment before opening session so pam_systemd picks them up.
     std::string xdg_type = "XDG_SESSION_TYPE=" + session_type;
     pam_putenv(pamh, xdg_type.c_str());
     pam_putenv(pamh, "XDG_SESSION_CLASS=user");
@@ -115,7 +165,7 @@ PamSession* PamAuth::openSession(const std::string& username,
         return nullptr;
     }
 
-    // SESSION AÇ
+    // Open the PAM session — this triggers pam_systemd to register the logind session.
     retval = pam_open_session(pamh, 0);
     fprintf(auth_debug, "pam_open_session: %d (%s)\n", retval, pam_strerror(pamh, retval));
     fflush(auth_debug);
@@ -131,7 +181,7 @@ PamSession* PamAuth::openSession(const std::string& username,
     fprintf(auth_debug, "pam_open_session SUCCESS!\n");
     fflush(auth_debug);
 
-    // PAM environment'tan session bilgilerini al
+    // Extract XDG_SESSION_ID and XDG_RUNTIME_DIR from the PAM environment list.
     char** pam_env = pam_getenvlist(pamh);
 
     PamSession* session = new PamSession();
@@ -158,7 +208,7 @@ PamSession* PamAuth::openSession(const std::string& username,
 
     fclose(env_debug);
 
-    // Eğer PAM'den gelemediyse manuel oluştur
+    // If pam_systemd did not provide a runtime dir, fall back to /run/user/<uid>.
     if (session->runtime_dir.empty()) {
         char runtime[256];
         struct passwd* pw = getpwnam(username.c_str());
@@ -167,7 +217,7 @@ PamSession* PamAuth::openSession(const std::string& username,
 
         fprintf(auth_debug, "Runtime dir not from PAM, using: %s\n", runtime);
 
-        // Runtime dir yoksa oluştur
+        // Create the directory if it does not exist yet.
         mkdir(runtime, 0700);
         chown(runtime, pw->pw_uid, pw->pw_gid);
     }

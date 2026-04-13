@@ -1,3 +1,19 @@
+// Main entry point for the custom Wayland greeter.
+// Author: tambiyusuf
+
+// Login flow:
+//   1. User selection
+//   2. Password prompt
+//   3. PAM password-only check (no session opened yet)
+//   4. Session type selection (only shown after successful auth)
+//   5. Full PAM session open with the chosen session type
+//   6. VT allocation + session launch via double-fork
+//   7. Greeter exits; session runs independently under systemd
+//
+// Known issues:
+//   - Spurious auth failure messages may appear after reboot.
+//   - Non-Wayland session types (X11 etc.) fail to start reliably.
+
 #include "ui/menu.hpp"
 #include "auth/pam_auth.hpp"
 #include "session/session_manager.hpp"
@@ -13,7 +29,7 @@
 
 using namespace greeter;
 
-// VT numarası bul
+// Queries the kernel for the next free VT number. Falls back to VT2 on failure.
 int allocateVT() {
     FILE* log = fopen("/tmp/main-full.log", "a");
     fprintf(log, "[allocateVT] Starting\n");
@@ -132,26 +148,33 @@ int main() {
         log = fopen("/tmp/main-full.log", "a");
         fprintf(log, "[main] Password received (length: %zu)\n", password.length());
         fflush(log);
-
-        // 3. VT allocate
-        fprintf(log, "[main] Calling allocateVT\n");
-        fflush(log);
-
-        int vt_number = allocateVT();
-
-        fprintf(log, "[main] VT allocated: %d\n", vt_number);
-        fflush(log);
         fclose(log);
 
+        // 3. Validate password first — session selection only shown if auth passes.
         menu.showMessage("Authenticating...", false);
 
         log = fopen("/tmp/main-full.log", "a");
-
-        // 4. Session selection
-        fprintf(log, "[main] Getting available sessions\n");
+        fprintf(log, "[main] Checking password (no session open yet)\n");
         fflush(log);
 
+        bool password_valid = auth.authenticatePassword(selected_user, password);
+
+        if (!password_valid) {
+            // Wrong password — loop back to user/password selection, never reach session list.
+            fprintf(log, "[main] Password verification FAILED!\n");
+            fclose(log);
+            menu.showMessage("Authentication failed!", true);
+            continue;
+        }
+
+        fprintf(log, "[main] Password verification SUCCESS!\n");
+        fflush(log);
+        fclose(log);
+
+        // 4. Session selection — reached only after successful password verification.
         auto sessions = sessionMgr.getAvailableSessions();
+
+        log = fopen("/tmp/main-full.log", "a");
         fprintf(log, "[main] Got %zu sessions\n", sessions.size());
         fflush(log);
 
@@ -174,7 +197,7 @@ int main() {
         fflush(log);
 
         if (session_choice == -1 || session_names[session_choice] == "Back") {
-            fprintf(log, "[main] Back selected, continuing loop\n");
+            fprintf(log, "[main] Back selected, returning to main menu\n");
             fclose(log);
             continue;
         }
@@ -182,28 +205,42 @@ int main() {
         fprintf(log, "[main] Selected session: %s\n", sessions[session_choice].name.c_str());
         fprintf(log, "[main] Session type: %s\n", sessions[session_choice].type.c_str());
         fflush(log);
+        fclose(log);
 
-        // 5. PAM SESSION AÇ
+        // 5. Open a full PAM session now that we know the session type.
+        menu.showMessage("Opening session...", false);
+
+        log = fopen("/tmp/main-full.log", "a");
         fprintf(log, "[main] Opening PAM session with type: %s\n", sessions[session_choice].type.c_str());
         fflush(log);
 
+        int temp_vt = 2;
         PamSession* pam_session = auth.openSession(
             selected_user,
             password,
-            vt_number,
+            temp_vt,
             sessions[session_choice].type
         );
 
         if (!pam_session) {
-            fprintf(log, "[main] PAM authentication failed\n");
+            fprintf(log, "[main] PAM session failed to open (unexpected!)\n");
             fclose(log);
-            menu.showMessage("Authentication failed!", true);
+            menu.showMessage("Failed to open session!", true);
             continue;
         }
 
         fprintf(log, "[main] PAM session opened successfully\n");
         fprintf(log, "[main] Session ID: %s\n", pam_session->session_id.c_str());
         fprintf(log, "[main] Runtime Dir: %s\n", pam_session->runtime_dir.c_str());
+        fflush(log);
+
+        // 6. VT allocation
+        fprintf(log, "[main] Allocating VT for session\n");
+        fflush(log);
+
+        int vt_number = allocateVT();
+
+        fprintf(log, "[main] VT allocated: %d\n", vt_number);
         fflush(log);
         fclose(log);
 
@@ -238,15 +275,15 @@ int main() {
             continue;
         }
 
-        // 6. Session başarıyla başladı - GREETER KAPANIYOR
+        // 7. Session launched — greeter exits and lets systemd handle restart.
+        //    PAM session is intentionally NOT closed here; the child process owns it.
         fprintf(log, "[main] Session started successfully\n");
         fprintf(log, "[main] Greeter exiting, session running in background\n");
         fprintf(log, "[main] PAM session remains open for child process\n");
         fflush(log);
         fclose(log);
 
-        // PAM session'ı KAPATMIYORUZ - child process kullanıyor!
-        // Greeter kapanıyor, systemd restart edecek
+        // Do NOT call closeSession() — the child process still needs the PAM handle.
         return 0;
     }
 

@@ -1,3 +1,9 @@
+// Session manager implementation — discovers .desktop sessions and launches them.
+// Author: tambiyusuf
+//
+// Known issues:
+//   - X11 sessions are discovered but launch unreliably (no Xorg startup logic).
+//   - dbus-run-session wrapper may not be appropriate for all session types.
 #include "session_manager.hpp"
 #include <unistd.h>
 #include <sys/types.h>
@@ -12,6 +18,9 @@
 #include <linux/vt.h>
 #include <linux/kd.h>
 #include <signal.h>
+#include <dirent.h>
+#include <fstream>
+#include <sstream>
 
 namespace greeter {
 
@@ -34,22 +43,190 @@ std::vector<SessionInfo> SessionManager::getAvailableSessions() {
     return sessions_;
 }
 
-void SessionManager::scanWaylandSessions() {
-    sessions_.push_back({
-        "KDE Plasma (Wayland)",
-        "startplasma-wayland",
-        "wayland"
-    });
+// Parses a freedesktop .desktop session file and extracts Name and Exec fields.
+SessionInfo SessionManager::parseDesktopFile(const std::string& filepath, const std::string& type) {
+    SessionInfo info;
+    info.type = type;
 
-    sessions_.push_back({
-        "Hyprland",
-        "Hyprland",
-        "wayland"
-    });
+    std::ifstream file(filepath);
+    if (!file.is_open()) {
+        return info;
+    }
+
+    std::string line;
+    bool in_desktop_entry = false;
+
+    while (std::getline(file, line)) {
+        // Skip empty lines and comments.
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+
+        // Locate the [Desktop Entry] section.
+        if (line == "[Desktop Entry]") {
+            in_desktop_entry = true;
+            continue;
+        }
+
+        // Stop parsing when a new section begins.
+        if (line[0] == '[' && in_desktop_entry) {
+            break;
+        }
+
+        if (!in_desktop_entry) {
+            continue;
+        }
+
+        // Parse Key=Value pairs.
+        size_t pos = line.find('=');
+        if (pos == std::string::npos) {
+            continue;
+        }
+
+        std::string key = line.substr(0, pos);
+        std::string value = line.substr(pos + 1);
+
+        // Trim leading/trailing whitespace from key and value.
+        key.erase(0, key.find_first_not_of(" \t"));
+        key.erase(key.find_last_not_of(" \t") + 1);
+        value.erase(0, value.find_first_not_of(" \t"));
+        value.erase(value.find_last_not_of(" \t") + 1);
+
+        if (key == "Name") {
+            info.name = value;
+        } else if (key == "Exec") {
+            info.exec_command = value;
+        } else if (key == "Type" && value != "Application") {
+            // Type Application olmalı, değilse geçersiz
+            info.name.clear();
+            break;
+        }
+    }
+
+    file.close();
+    return info;
+}
+
+void SessionManager::scanWaylandSessions() {
+    const char* wayland_dir = "/usr/share/wayland-sessions";
+
+    FILE* log = fopen("/tmp/session-scan-wayland.log", "w");
+    fprintf(log, "=== Scanning Wayland Sessions ===\n");
+    fprintf(log, "Directory: %s\n", wayland_dir);
+
+    DIR* dir = opendir(wayland_dir);
+    if (!dir) {
+        fprintf(log, "Failed to open directory: %s\n", strerror(errno));
+        fprintf(log, "Falling back to hardcoded sessions\n");
+        fclose(log);
+
+        // Fallback: hardcoded sessions
+        sessions_.push_back({
+            "KDE Plasma (Wayland)",
+            "startplasma-wayland",
+            "wayland"
+        });
+        sessions_.push_back({
+            "Hyprland",
+            "Hyprland",
+            "wayland"
+        });
+        return;
+    }
+
+    struct dirent* entry;
+    int count = 0;
+
+    while ((entry = readdir(dir)) != nullptr) {
+        // Only process .desktop files.
+        std::string filename = entry->d_name;
+        if (filename.length() < 8 || filename.substr(filename.length() - 8) != ".desktop") {
+            continue;
+        }
+
+        std::string filepath = std::string(wayland_dir) + "/" + filename;
+        fprintf(log, "Found: %s\n", filepath.c_str());
+
+        SessionInfo session = parseDesktopFile(filepath, "wayland");
+
+        if (!session.name.empty() && !session.exec_command.empty()) {
+            fprintf(log, "  Name: %s\n", session.name.c_str());
+            fprintf(log, "  Exec: %s\n", session.exec_command.c_str());
+            fprintf(log, "  Type: %s\n", session.type.c_str());
+
+            sessions_.push_back(session);
+            count++;
+        } else {
+            fprintf(log, "  Skipped (invalid or incomplete)\n");
+        }
+    }
+
+    closedir(dir);
+
+    fprintf(log, "Total Wayland sessions found: %d\n", count);
+    fclose(log);
+
+    // No .desktop files found — fall back to hardcoded Wayland sessions.
+    if (count == 0) {
+        sessions_.push_back({
+            "KDE Plasma (Wayland)",
+            "startplasma-wayland",
+            "wayland"
+        });
+        sessions_.push_back({
+            "Hyprland",
+            "Hyprland",
+            "wayland"
+        });
+    }
 }
 
 void SessionManager::scanX11Sessions() {
-    // X11 session support is not yet implemented
+    const char* x11_dir = "/usr/share/xsessions";
+
+    FILE* log = fopen("/tmp/session-scan-x11.log", "w");
+    fprintf(log, "=== Scanning X11 Sessions ===\n");
+    fprintf(log, "Directory: %s\n", x11_dir);
+
+    DIR* dir = opendir(x11_dir);
+    if (!dir) {
+        fprintf(log, "Failed to open directory: %s\n", strerror(errno));
+        fprintf(log, "No X11 sessions available\n");
+        fclose(log);
+        return;
+    }
+
+    struct dirent* entry;
+    int count = 0;
+
+    while ((entry = readdir(dir)) != nullptr) {
+        // Only process .desktop files.
+        std::string filename = entry->d_name;
+        if (filename.length() < 8 || filename.substr(filename.length() - 8) != ".desktop") {
+            continue;
+        }
+
+        std::string filepath = std::string(x11_dir) + "/" + filename;
+        fprintf(log, "Found: %s\n", filepath.c_str());
+
+        SessionInfo session = parseDesktopFile(filepath, "x11");
+
+        if (!session.name.empty() && !session.exec_command.empty()) {
+            fprintf(log, "  Name: %s\n", session.name.c_str());
+            fprintf(log, "  Exec: %s\n", session.exec_command.c_str());
+            fprintf(log, "  Type: %s\n", session.type.c_str());
+
+            sessions_.push_back(session);
+            count++;
+        } else {
+            fprintf(log, "  Skipped (invalid or incomplete)\n");
+        }
+    }
+
+    closedir(dir);
+
+    fprintf(log, "Total X11 sessions found: %d\n", count);
+    fclose(log);
 }
 
 bool SessionManager::startSession(const std::string& username,
@@ -75,7 +252,7 @@ bool SessionManager::startSession(const std::string& username,
     fflush(log);
     fclose(log);
 
-    // FIRST FORK - Intermediate process
+    // First fork — creates an intermediate process so the greeter can return immediately.
     pid_t intermediate_pid = fork();
 
     if (intermediate_pid < 0) {
@@ -84,14 +261,14 @@ bool SessionManager::startSession(const std::string& username,
     }
 
     if (intermediate_pid > 0) {
-        // GREETER - hemen return
+        // Greeter process — return true and let systemd restart the greeter service.
         close(vt_fd);
         return true;
     }
 
     // === INTERMEDIATE PROCESS ===
 
-    // Systemd'den ayrıl
+    // Detach from the greeter's session so the child outlives it.
     setsid();
 
     signal(SIGTERM, intermediate_signal_handler);
@@ -102,7 +279,7 @@ bool SessionManager::startSession(const std::string& username,
     fprintf(intermediate_log, "PID: %d, PPID: %d, SID: %d\n", getpid(), getppid(), getsid(0));
     fflush(intermediate_log);
 
-    // SECOND FORK - Session process
+    // Second fork — the actual session process; intermediate waits for it to exit.
     pid_t session_pid = fork();
 
     if (session_pid < 0) {
@@ -205,19 +382,33 @@ bool SessionManager::startSession(const std::string& username,
 
         // Exec session
         std::string exec_cmd;
-        if (session.type == "wayland") {
+
+        // Wrap with dbus-run-session unless the command already manages its own D-Bus session.
+        bool needs_dbus_wrapper = true;
+
+        // Skip the wrapper for commands that bring their own session/dbus manager.
+        if (session.exec_command.find("uwsm") == 0 ||
+            session.exec_command.find("systemd-run") == 0 ||
+            session.exec_command.find("/usr/lib/") == 0 ||
+            session.exec_command.find("dbus-run-session") != std::string::npos ||
+            session.exec_command.find("dbus-launch") != std::string::npos) {
+            needs_dbus_wrapper = false;
+        }
+
+        if (needs_dbus_wrapper) {
             exec_cmd = "dbus-run-session " + session.exec_command;
-        } else if (session.type == "x11") {
-            exec_cmd = "/bin/sh /tmp/.xinitrc-greeter";
+        } else {
+            exec_cmd = session.exec_command;
         }
 
         fprintf(child_log, "Executing: %s\n", exec_cmd.c_str());
+        fprintf(child_log, "DBus wrapper needed: %s\n", needs_dbus_wrapper ? "yes" : "no");
         fflush(child_log);
         fclose(child_log);
 
         execl("/bin/sh", "sh", "-c", exec_cmd.c_str(), nullptr);
 
-        // Exec failed
+        // execl() only returns on failure.
         FILE* err_log = fopen("/tmp/greeter-child.log", "a");
         fprintf(err_log, "exec failed: %s\n", strerror(errno));
         fclose(err_log);
@@ -239,7 +430,7 @@ bool SessionManager::startSession(const std::string& username,
     fprintf(intermediate_log, "Switching back to VT1...\n");
     fflush(intermediate_log);
 
-    // VT1'e dön (greeter için)
+    // Switch back to VT1 so the greeter (restarted by systemd) is visible.
     int tty0 = open("/dev/tty0", O_RDWR);
     if (tty0 >= 0) {
         fprintf(intermediate_log, "tty0 opened successfully (fd=%d)\n", tty0);
